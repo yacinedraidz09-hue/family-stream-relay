@@ -128,6 +128,38 @@ def start_tunnel_watcher():
     t = threading.Thread(target=watcher_thread, daemon=True)
     t.start()
 
+def start_heartbeat():
+    def heartbeat_thread():
+        cs_map = {
+            "yakaha": "turbo-goggles-j6757vwvvg2qg9r",
+            "yacinedraidz09-hue": "improved-palm-tree-5g6p9v5g695q34vw"
+        }
+        while True:
+            time.sleep(180) # every 3 minutes
+            now = time.time()
+            if now - last_request_time < 600:
+                owner = detect_repo_owner()
+                token = _resolve_token(owner)
+                cs_name = os.environ.get("CODESPACE_NAME") or cs_map.get(owner, "turbo-goggles-j6757vwvvg2qg9r")
+                start_url = f"https://api.github.com/user/codespaces/{cs_name}/start"
+                try:
+                    req = urllib.request.Request(
+                        start_url,
+                        data=b"",
+                        headers={
+                            "Authorization": f"token {token}",
+                            "Accept": "application/vnd.github.v3+json",
+                            "User-Agent": "RelayKeepAlive"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        print(f"[KeepAlive] Active streaming heartbeat sent to {cs_name} (HTTP {r.status})", flush=True)
+                except Exception as e:
+                    print(f"[KeepAlive] Heartbeat error: {e}", flush=True)
+    t = threading.Thread(target=heartbeat_thread, daemon=True)
+    t.start()
+
 def load_source_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -432,7 +464,9 @@ if __name__ == "__main__":
     os.makedirs(HLS_DIR, exist_ok=True)
     # 1. Start Cloudflare Tunnel watcher in background
     start_tunnel_watcher()
-    # 2. Pre-start Canal+ Foot (832106)
+    # 2. Start Keep-Alive Heartbeat in background (prevents GitHub 30m idle timeout while watching)
+    start_heartbeat()
+    # 3. Pre-start Canal+ Foot (832106)
     start_stream_for_channel("832106")
 
     socketserver.TCPServer.allow_reuse_address = True
