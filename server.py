@@ -13,6 +13,7 @@ PORT = 8888
 HLS_DIR = "/tmp/hls"
 CHANNELS_FILE = os.path.join(os.path.dirname(__file__), "channels.json")
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "source_config.json")
+PLAYLIST_FILE = os.path.join(os.path.dirname(__file__), "playlist.m3u")
 
 DEFAULT_SOURCE_CONFIG = {
     "type": "mac_portal",
@@ -23,7 +24,8 @@ DEFAULT_SOURCE_CONFIG = {
     "username": "",
     "password": "",
     "m3u_url": "",
-    "xtream_url": ""
+    "xtream_url": "",
+    "filename": "playlist.m3u"
 }
 
 active_stream_id = None
@@ -57,6 +59,12 @@ def check_source_connectivity(cfg):
     stype = cfg.get("type", "mac_portal")
     host = ""
     port = 80
+    if stype == "m3u_file":
+        fn = cfg.get("filename", "playlist.m3u")
+        fp = os.path.join(os.path.dirname(__file__), fn)
+        has_file = os.path.exists(fp) or os.path.exists(CHANNELS_FILE)
+        return {"online": has_file, "host": fn, "port": 0, "info": "Fichier M3U local"}
+
     if stype in ["mac_portal", "xtream"]:
         raw = cfg.get("host", "").replace("http://", "").replace("https://", "")
         if ":" in raw:
@@ -105,7 +113,23 @@ def build_stream_url_for_channel(stream_id, ch=None):
     cfg = load_source_config()
     stype = cfg.get("type", "mac_portal")
 
-    if stype == "mac_portal":
+    if stype == "m3u_file":
+        if ch and ch.get("url"):
+            return ch.get("url")
+        m3u_fp = os.path.join(os.path.dirname(__file__), cfg.get("filename", "playlist.m3u"))
+        if os.path.exists(m3u_fp):
+            try:
+                with open(m3u_fp, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.read().splitlines()
+                    for i, l in enumerate(lines):
+                        if str(stream_id) in l and i + 1 < len(lines):
+                            nxt = lines[i + 1].strip()
+                            if nxt.startswith("http"):
+                                return nxt
+            except Exception as e:
+                print(f"[M3U] Error reading file: {e}")
+
+    elif stype == "mac_portal":
         raw_host = cfg.get("host", "dinofox.sbs").replace("http://", "").replace("https://", "").rstrip("/")
         port = cfg.get("port", 80) or 80
         mac = cfg.get("mac", "00:1A:79:B5:0D:61")
@@ -282,7 +306,6 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                 new_cfg = json.loads(body)
                 save_source_config(new_cfg)
                 
-                # Restart stream if one was active
                 if active_stream_id:
                     start_stream_for_channel(active_stream_id, force_restart=True)
                     
@@ -293,6 +316,37 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                     "config": cur_cfg,
                     "health": check_source_connectivity(cur_cfg)
                 })
+            except Exception as e:
+                self.render_json({"success": False, "error": str(e)}, 400)
+            return
+
+        if parsed.path == "/api/upload_m3u":
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8')
+                data = json.loads(body)
+                m3u_text = data.get("content", "")
+                channels = data.get("channels", [])
+                
+                # Save playlist.m3u
+                if m3u_text:
+                    with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
+                        f.write(m3u_text)
+                
+                # Save channels.json if provided
+                if channels:
+                    with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
+                        json.dump(channels, f, indent=2, ensure_ascii=False)
+                        
+                cfg = load_source_config()
+                cfg["type"] = "m3u_file"
+                cfg["filename"] = "playlist.m3u"
+                save_source_config(cfg)
+                
+                if active_stream_id:
+                    start_stream_for_channel(active_stream_id, force_restart=True)
+                    
+                self.render_json({"success": True, "channels_count": len(channels)})
             except Exception as e:
                 self.render_json({"success": False, "error": str(e)}, 400)
             return
