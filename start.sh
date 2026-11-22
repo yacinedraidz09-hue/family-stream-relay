@@ -13,20 +13,19 @@ sleep 1
 # 1. Start Python On-Demand Server & Stream Manager
 nohup python3 server.py > /tmp/http.log 2>&1 &
 echo "On-Demand Server running on port 8888"
+sleep 1
 
 # 2. Start Cloudflare Tunnel
 nohup cloudflared tunnel --url http://127.0.0.1:8888 > /tmp/tunnel.log 2>&1 &
 echo "Cloudflare Tunnel started"
 
-# 3. Wait for tunnel URL and first playlist
+# 3. Wait for tunnel URL (break as soon as found!)
 TUNNEL_URL=""
-for i in {1..40}; do
+for i in {1..35}; do
   sleep 1
-  if [ -z "$TUNNEL_URL" ]; then
-    TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1)
-  fi
-  if [ -n "$TUNNEL_URL" ] && [ -f /tmp/hls/live.m3u8 ]; then
-    echo "Found tunnel: $TUNNEL_URL and playlist exists!"
+  TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1)
+  if [ -n "$TUNNEL_URL" ]; then
+    echo "Found tunnel: $TUNNEL_URL"
     break
   fi
 done
@@ -43,3 +42,16 @@ if [ -n "$TUNNEL_URL" ]; then
   git commit -m "Live stream URL: $STREAM_URL" || true
   git push origin main || true
 fi
+
+# 4. Watchdog keep-alive loop so Codespace container stays alive permanently
+while true; do
+  sleep 20
+  if ! pgrep -f "server.py" > /dev/null; then
+    echo "[Watchdog] Restarting server.py..."
+    nohup python3 server.py >> /tmp/http.log 2>&1 &
+  fi
+  if ! pgrep -f "cloudflared" > /dev/null; then
+    echo "[Watchdog] Restarting cloudflared..."
+    nohup cloudflared tunnel --url http://127.0.0.1:8888 >> /tmp/tunnel.log 2>&1 &
+  fi
+done
