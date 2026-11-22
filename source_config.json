@@ -1,0 +1,11 @@
+{
+  "type": "mac_portal",
+  "name": "Serveur Principal Stalker",
+  "host": "dinofox.sbs",
+  "port": 80,
+  "mac": "00:1A:79:B5:0D:61",
+  "username": "",
+  "password": "",
+  "m3u_url": "",
+  "xtream_url": ""
+}
