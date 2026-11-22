@@ -3,5 +3,18 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    }
+  },
+  "forwardPorts": [8888],
+  "portsAttributes": {
+    "8888": {
+      "label": "Family Stream Relay",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  },
   "postStartCommand": "bash /workspaces/family-stream-relay/start.sh"
 }
