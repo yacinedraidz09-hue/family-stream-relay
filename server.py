@@ -33,9 +33,15 @@ DEFAULT_SOURCE_CONFIG = {
 
 active_stream_id = None
 active_channel_name = "Canal+ Foot"
+last_channel_switch_time = 0.0
 ffmpeg_proc = None
 ffmpeg_lock = threading.Lock()
 last_request_time = time.time()
+
+# In-Memory RAM Segment & Playlist Cache for ultra-fast multi-client streaming
+SEGMENT_CACHE = {}       # filename -> bytes
+CACHE_LOCK = threading.Lock()
+MAX_CACHE_ITEMS = 30     # Keep last 30 segments in RAM (~90MB)
 
 def _resolve_token(owner):
     env_tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -292,14 +298,24 @@ def build_stream_url_for_channel(stream_id, ch=None):
     return f"http://line.liondnscloud.ru:80/live/5b596694/c750a8bf/{stream_id}.ts"
 
 def start_stream_for_channel(stream_id, force_restart=False):
-    global ffmpeg_proc, active_stream_id, active_channel_name, last_request_time
+    global ffmpeg_proc, active_stream_id, active_channel_name, last_request_time, last_channel_switch_time
     with ffmpeg_lock:
-        last_request_time = time.time()
+        now = time.time()
+        last_request_time = now
 
+        # 1. If already streaming this channel, nothing to do
         if not force_restart and active_stream_id == str(stream_id) and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
             return True
 
+        # 2. ANTI-FLAPPING ARBITRATOR (Crucial for Multi-Account Stability):
+        # If another channel switch occurred less than 15s ago, do NOT restart FFmpeg to prevent rapid ping-pong oscillation!
+        if not force_restart and active_stream_id is not None and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
+            if now - last_channel_switch_time < 15.0:
+                print(f"[On-Demand] Channel switch to {stream_id} debounced (active channel {active_stream_id} locked for stability).", flush=True)
+                return True
+
         print(f"[On-Demand] Switching stream to channel ID: {stream_id}", flush=True)
+        last_channel_switch_time = now
 
         if ffmpeg_proc:
             print("[On-Demand] Stopping previous FFmpeg process...", flush=True)
@@ -312,6 +328,10 @@ def start_stream_for_channel(stream_id, force_restart=False):
                 except Exception:
                     pass
             ffmpeg_proc = None
+
+        # Clean RAM cache on channel switch
+        with CACHE_LOCK:
+            SEGMENT_CACHE.clear()
 
         os.makedirs(HLS_DIR, exist_ok=True)
         for f in os.listdir(HLS_DIR):
@@ -327,12 +347,12 @@ def start_stream_for_channel(stream_id, force_restart=False):
         active_stream_id = str(stream_id)
         playlist_path = os.path.join(HLS_DIR, "live.m3u8")
 
-        # ROBUST ANTI-CUT & ANTI-BUFFERING HLS SETTINGS:
-        # -rw_timeout 15000000 (15s read/write timeout prevents stalling)
+        # ROBUST ANTI-CUT & MULTI-CLIENT HLS SETTINGS:
+        # -rw_timeout 15000000: 15s network timeout prevents drops
         # -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5
         # -analyzeduration 2000000 -probesize 2000000
-        # -hls_time 3: 3-second segments for smooth delivery without micro-chopping
-        # -hls_list_size 15: 15 rolling segments (45-60s sliding window, eliminates HTTP 404 segment drops!)
+        # -hls_time 3: 3-second segments for smooth delivery
+        # -hls_list_size 15: 15 rolling segments = 45s sliding buffer window
         # -hls_flags delete_segments+append_list
         # -hls_allow_cache 1
         cmd = [
@@ -359,7 +379,6 @@ def start_stream_for_channel(stream_id, force_restart=False):
         print(f"[On-Demand] Starting FFmpeg: {stream_url}", flush=True)
         ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Wait until playlist exists AND contains at least one #EXTINF segment
         for _ in range(60):
             time.sleep(0.1)
             if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
@@ -376,6 +395,12 @@ def start_stream_for_channel(stream_id, force_restart=False):
 class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=HLS_DIR, **kwargs)
+
+    def log_message(self, format, *args):
+        # Suppress noisy GET log spam for .ts files to keep log clean
+        if len(args) > 0 and isinstance(args[0], str) and (".ts" in args[0] or "200" in str(args[1])):
+            return
+        super().log_message(format, *args)
 
     def end_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -408,32 +433,30 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             stream_id = path.replace("/hls/", "").replace(".m3u8", "").strip()
             if stream_id:
                 start_stream_for_channel(stream_id)
-                self.path = "/live.m3u8"
-                return super().do_GET()
+            self.serve_live_m3u8()
+            return
 
         # 2. Direct or legacy playlist: /live.m3u8 or /bein1.m3u8
         if path in ["/bein1.m3u8", "/live.m3u8"]:
             if active_stream_id is None:
                 start_stream_for_channel("832106")
-            self.path = "/live.m3u8"
-            return super().do_GET()
+            self.serve_live_m3u8()
+            return
 
-        # 3. TS Video segments
+        # 3. TS Video segments with in-memory RAM caching for multi-client performance
         if path.endswith(".ts"):
-            if path.startswith("/hls/"):
-                self.path = "/" + os.path.basename(path)
-            try:
-                return super().do_GET()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+            segment_name = os.path.basename(path)
+            self.serve_ts_segment(segment_name)
+            return
 
         # 4. Status API
         if path == "/api/status":
             self.render_json({
                 "status": "online",
-                "mode": "on_demand",
+                "mode": "on_demand_multithreaded",
                 "active_stream_id": active_stream_id,
                 "active_channel_name": active_channel_name,
+                "cached_segments_in_ram": len(SEGMENT_CACHE),
                 "ffmpeg_running": ffmpeg_proc is not None and ffmpeg_proc.poll() is None
             })
             return
@@ -464,6 +487,63 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             return super().do_GET()
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def serve_live_m3u8(self):
+        playlist_path = os.path.join(HLS_DIR, "live.m3u8")
+        if not os.path.exists(playlist_path):
+            self.send_error(404, "Playlist not ready yet.")
+            return
+
+        try:
+            with open(playlist_path, "rb") as f:
+                content = f.read()
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            self.send_error(500, f"Error reading playlist: {e}")
+
+    def serve_ts_segment(self, segment_name):
+        # 1. Check in-memory RAM cache first (instant response for all concurrent accounts)
+        data = None
+        with CACHE_LOCK:
+            data = SEGMENT_CACHE.get(segment_name)
+
+        if data is None:
+            # 2. Read from disk and store in RAM cache
+            file_path = os.path.join(HLS_DIR, segment_name)
+            if not os.path.exists(file_path):
+                self.send_error(404, f"Segment {segment_name} not found.")
+                return
+
+            try:
+                with open(file_path, "rb") as f:
+                    data = f.read()
+                with CACHE_LOCK:
+                    SEGMENT_CACHE[segment_name] = data
+                    # Evict oldest if cache exceeds limit
+                    if len(SEGMENT_CACHE) > MAX_CACHE_ITEMS:
+                        oldest_key = next(iter(SEGMENT_CACHE))
+                        del SEGMENT_CACHE[oldest_key]
+            except Exception as e:
+                self.send_error(500, f"Error reading segment: {e}")
+                return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -557,6 +637,11 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+# MULTI-THREADED HTTP SERVER (Handles unlimited simultaneous clients/accounts in parallel threads)
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
 if __name__ == "__main__":
     os.makedirs(HLS_DIR, exist_ok=True)
     # 1. Start Cloudflare Tunnel watcher in background
@@ -566,9 +651,9 @@ if __name__ == "__main__":
     # 3. Pre-start Canal+ Foot (832106)
     start_stream_for_channel("832106")
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("", PORT), OnDemandRelayHandler) as httpd:
-        print(f"[Family Stream Relay] Server running on port {PORT}", flush=True)
+    server_address = ("", PORT)
+    with ThreadedHTTPServer(server_address, OnDemandRelayHandler) as httpd:
+        print(f"[Family Stream Relay] Multi-Threaded Server running on port {PORT}", flush=True)
         try:
             httpd.serve_forever()
         finally:
