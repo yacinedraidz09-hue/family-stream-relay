@@ -123,7 +123,7 @@ def start_tunnel_watcher():
                             print(f"[Watcher] Detected active Cloudflare tunnel: {live_m3u8}", flush=True)
                             if publish_stream_url_to_github(live_m3u8):
                                 last_url = live_m3u8
-                except Exception as e:
+                except Exception:
                     pass
     t = threading.Thread(target=watcher_thread, daemon=True)
     t.start()
@@ -197,6 +197,63 @@ def get_channel_by_id(stream_id):
             return ch
     return None
 
+def sync_xtream_channels(cfg=None):
+    if cfg is None:
+        cfg = load_source_config()
+    if cfg.get("type") != "xtream":
+        return load_channels()
+
+    raw_host = cfg.get("host", "http://line.liondnscloud.ru:80").rstrip("/")
+    if not raw_host.startswith("http"):
+        raw_host = f"http://{raw_host}"
+    u = cfg.get("username", "5b596694")
+    p = cfg.get("password", "c750a8bf")
+
+    print(f"[Sync] Synchronizing channels from Xtream server: {raw_host} ...", flush=True)
+    categories_to_fetch = [
+        ('1340', 'FR SPORTS | TV'),
+        ('1531', 'FR CANAL+ LIVE | TV'),
+        ('1526', 'FR LIGUE1 + | TV'),
+        ('1590', 'FR LIGUE 1+ VIP | TV'),
+        ('1666', 'FR DAZN LA LIGA | TV'),
+        ('1510', "FR L'EQUIPE LIVE | TV"),
+        ('1660', 'FR SOCCER PPV | TV'),
+        ('1337', 'FRANCE FHD | TV'),
+        ('1164', '[AR] BEIN SPORTS'),
+        ('1433', '[AR] BEIN SPORTS UHD'),
+        ('789',  '[AR] BEIN SPORTS 4K'),
+        ('1118', '[AR] BEIN PREMIUM'),
+        ('1075', '[UK] SPORTS')
+    ]
+
+    channels = []
+    for cid, cname in categories_to_fetch:
+        url = f"{raw_host}/player_api.php?username={u}&password={p}&action=get_live_streams&category_id={cid}"
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'VLC/3.0.18'})
+            with urllib.request.urlopen(req, timeout=12) as r:
+                streams = json.loads(r.read().decode('utf-8', errors='ignore'))
+                for s in streams:
+                    channels.append({
+                        'id': str(s.get('stream_id')),
+                        'name': s.get('name', ''),
+                        'category': cname,
+                        'category_id': cid,
+                        'logo': s.get('stream_icon', '')
+                    })
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[Sync] Warning on {cname}: {e}", flush=True)
+
+    if channels:
+        try:
+            with open(CHANNELS_FILE, "w", encoding="utf-8") as f:
+                json.dump(channels, f, ensure_ascii=False, indent=2)
+            print(f"[Sync] Successfully updated channels.json with {len(channels)} channels!", flush=True)
+        except Exception as e:
+            print(f"[Sync] Error saving channels.json: {e}", flush=True)
+    return channels
+
 def build_stream_url_for_channel(stream_id, ch=None):
     cfg = load_source_config()
     stype = cfg.get("type", "xtream")
@@ -210,9 +267,11 @@ def build_stream_url_for_channel(stream_id, ch=None):
         return f"{raw_host}/live/{u}/{p}/{stream_id}.ts"
 
     elif stype == "mac_portal":
-        raw_host = cfg.get("host", "dinofox.sbs").replace("http://", "").replace("https://", "").rstrip("/")
-        port = cfg.get("port", 80) or 80
-        mac = cfg.get("mac", "00:1A:79:B5:0D:61")
+        raw_host = cfg.get("host", "103.176.90.154").rstrip("/")
+        if not raw_host.startswith("http"):
+            raw_host = f"http://{raw_host}"
+        port = cfg.get("port", 80)
+        mac = cfg.get("mac", "")
         return f"http://{raw_host}:{port}/play/live.php?mac={mac}&stream={stream_id}&extension=ts"
 
     elif stype == "xtream_url":
@@ -268,31 +327,49 @@ def start_stream_for_channel(stream_id, force_restart=False):
         active_stream_id = str(stream_id)
         playlist_path = os.path.join(HLS_DIR, "live.m3u8")
 
+        # ROBUST ANTI-CUT & ANTI-BUFFERING HLS SETTINGS:
+        # -rw_timeout 15000000 (15s read/write timeout prevents stalling)
+        # -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5
+        # -analyzeduration 2000000 -probesize 2000000
+        # -hls_time 3: 3-second segments for smooth delivery without micro-chopping
+        # -hls_list_size 15: 15 rolling segments (45-60s sliding window, eliminates HTTP 404 segment drops!)
+        # -hls_flags delete_segments+append_list
+        # -hls_allow_cache 1
         cmd = [
             "ffmpeg",
+            "-rw_timeout", "15000000",
             "-reconnect", "1",
             "-reconnect_at_eof", "1",
             "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "2",
+            "-reconnect_delay_max", "5",
+            "-analyzeduration", "2000000",
+            "-probesize", "2000000",
             "-user_agent", "VLC/3.0.18",
             "-i", stream_url,
             "-c", "copy",
             "-f", "hls",
-            "-hls_time", "2",
-            "-hls_list_size", "6",
-            "-hls_flags", "delete_segments",
+            "-hls_time", "3",
+            "-hls_list_size", "15",
+            "-hls_flags", "delete_segments+append_list",
             "-hls_segment_type", "mpegts",
+            "-hls_allow_cache", "1",
             playlist_path
         ]
 
         print(f"[On-Demand] Starting FFmpeg: {stream_url}", flush=True)
         ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        for _ in range(35):
+        # Wait until playlist exists AND contains at least one #EXTINF segment
+        for _ in range(60):
             time.sleep(0.1)
-            if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 0:
-                print(f"[On-Demand] Playlist ready for channel {stream_id}!", flush=True)
-                break
+            if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
+                try:
+                    with open(playlist_path, "r", errors="ignore") as pf:
+                        if "#EXTINF" in pf.read():
+                            print(f"[On-Demand] Playlist with active segments ready for channel {stream_id}!", flush=True)
+                            break
+                except Exception:
+                    pass
 
         return True
 
@@ -312,6 +389,12 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.end_headers()
+
+    def copyfile(self, source, outputfile):
+        try:
+            super().copyfile(source, outputfile)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         global last_request_time
@@ -339,7 +422,10 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         if path.endswith(".ts"):
             if path.startswith("/hls/"):
                 self.path = "/" + os.path.basename(path)
-            return super().do_GET()
+            try:
+                return super().do_GET()
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
         # 4. Status API
         if path == "/api/status":
@@ -358,6 +444,12 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             self.render_json(channels)
             return
 
+        # 5b. Force Sync Channels API
+        if path == "/api/sync_channels":
+            channels = sync_xtream_channels()
+            self.render_json({"success": True, "count": len(channels)})
+            return
+
         # 6. Source Config API
         if path == "/api/source":
             self.render_json(load_source_config())
@@ -368,7 +460,10 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             self.render_control_page()
             return
 
-        return super().do_GET()
+        try:
+            return super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -379,6 +474,8 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                 body = self.rfile.read(length).decode('utf-8')
                 new_cfg = json.loads(body)
                 save_source_config(new_cfg)
+                if new_cfg.get("type") == "xtream":
+                    threading.Thread(target=sync_xtream_channels, args=(new_cfg,), daemon=True).start()
                 if active_stream_id:
                     start_stream_for_channel(active_stream_id, force_restart=True)
                 cur_cfg = load_source_config()
