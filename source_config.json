@@ -1,8 +1,11 @@
 {
   "type": "xtream",
   "name": "Serveur Xtream Codes",
-  "host": "line.liondnscloud.ru",
+  "host": "http://line.liondnscloud.ru:80",
   "port": 80,
+  "mac": "",
   "username": "5b596694",
-  "password": "c750a8bf"
+  "password": "c750a8bf",
+  "m3u_url": "",
+  "xtream_url": ""
 }
