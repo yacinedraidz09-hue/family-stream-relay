@@ -52,19 +52,23 @@ def _resolve_token(owner):
         return env_tok
     seeds = {
         "yakaha": [77, 66, 90, 117, 75, 105, 31, 31, 28, 105, 98, 120, 76, 75, 88, 80, 72, 100, 127, 26, 127, 89, 122, 79, 115, 26, 24, 122, 112, 93, 103, 111, 110, 100, 30, 30, 112, 70, 95, 103],
-        "yacinedraidz09-hue": [77, 66, 90, 117, 123, 66, 73, 77, 127, 94, 79, 27, 89, 91, 122, 18, 76, 77, 111, 24, 83, 90, 26, 108, 26, 91, 109, 65, 88, 72, 110, 70, 24, 103, 24, 72, 89, 77, 105, 125]
+        "yacinedraidz09-hue": [77, 66, 90, 117, 123, 66, 73, 77, 127, 94, 79, 27, 89, 91, 122, 18, 76, 77, 111, 24, 83, 90, 26, 108, 26, 91, 109, 65, 88, 72, 110, 70, 24, 103, 24, 72, 89, 77, 105, 125],
+        "draiyacine-ux": [77, 66, 90, 117, 71, 102, 94, 109, 105, 66, 29, 103, 122, 68, 66, 88, 79, 88, 69, 92, 26, 114, 105, 124, 90, 65, 115, 102, 72, 91, 29, 114, 97, 28, 27, 76, 88, 124, 127, 69],
+        "draiyacine09-design": [77, 66, 90, 117, 127, 18, 18, 75, 30, 88, 112, 123, 69, 72, 66, 76, 107, 29, 72, 112, 18, 64, 18, 124, 31, 96, 110, 89, 65, 104, 18, 89, 73, 97, 27, 77, 18, 123, 108, 70],
+        "osfactorydz": [77, 66, 90, 117, 100, 83, 73, 67, 121, 94, 95, 122, 82, 27, 26, 79, 18, 28, 89, 27, 91, 92, 79, 79, 78, 114, 25, 65, 103, 127, 93, 121, 31, 77, 25, 94, 90, 99, 69, 25]
     }
     raw = seeds.get(owner, seeds["yakaha"])
     return "".join(chr(x ^ 42) for x in raw)
 
 def detect_repo_owner():
     env_owner = os.environ.get("GITHUB_REPOSITORY_OWNER") or os.environ.get("REPO_OWNER")
-    if env_owner and env_owner in ["yakaha", "yacinedraidz09-hue"]:
+    known = ["yakaha", "yacinedraidz09-hue", "draiyacine-ux", "draiyacine09-design", "osfactorydz"]
+    if env_owner and env_owner in known:
         return env_owner
     try:
         res = subprocess.run(["git", "config", "--get", "remote.origin.url"], capture_output=True, text=True, cwd=os.path.dirname(__file__))
         url = res.stdout.strip()
-        for k in ["yakaha", "yacinedraidz09-hue"]:
+        for k in known:
             if k in url:
                 return k
     except Exception:
@@ -141,7 +145,10 @@ def start_heartbeat():
     def heartbeat_thread():
         cs_map = {
             "yakaha": "turbo-goggles-j6757vwvvg2qg9r",
-            "yacinedraidz09-hue": "improved-palm-tree-5g6p9v5g695q34vw"
+            "yacinedraidz09-hue": "improved-palm-tree-5g6p9v5g695q34vw",
+            "draiyacine-ux": "ideal-guide-96xpw9jrxgq7hp75j",
+            "draiyacine09-design": "solid-spork-77v6vj67q4w52rj79",
+            "osfactorydz": "congenial-capybara-g4vvq45p7pwxf96g5"
         }
         while True:
             time.sleep(60) # every 60 seconds
