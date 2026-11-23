@@ -141,7 +141,7 @@ def start_heartbeat():
             "yacinedraidz09-hue": "improved-palm-tree-5g6p9v5g695q34vw"
         }
         while True:
-            time.sleep(180) # every 3 minutes
+            time.sleep(60) # every 60 seconds
             now = time.time()
             if now - last_request_time < 600:
                 owner = detect_repo_owner()
@@ -303,15 +303,17 @@ def start_stream_for_channel(stream_id, force_restart=False):
         now = time.time()
         last_request_time = now
 
-        # 1. If already streaming this channel, nothing to do
+        # 1. If already streaming this channel and FFmpeg is running, nothing to do
         if not force_restart and active_stream_id == str(stream_id) and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
             return True
 
-        # 2. ANTI-FLAPPING ARBITRATOR (Crucial for Multi-Account Stability):
-        # If another channel switch occurred less than 15s ago, do NOT restart FFmpeg to prevent rapid ping-pong oscillation!
+        # 2. Fast-switch anti-flapping guard:
+        # Ignore duplicate requests for the same channel within 2.0s
         if not force_restart and active_stream_id is not None and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
-            if now - last_channel_switch_time < 15.0:
-                print(f"[On-Demand] Channel switch to {stream_id} debounced (active channel {active_stream_id} locked for stability).", flush=True)
+            if str(stream_id) == active_stream_id:
+                return True
+            if now - last_channel_switch_time < 2.0:
+                print(f"[On-Demand] Fast switch debounce: ignoring {stream_id} within 2s of last switch", flush=True)
                 return True
 
         print(f"[On-Demand] Switching stream to channel ID: {stream_id}", flush=True)
@@ -321,7 +323,7 @@ def start_stream_for_channel(stream_id, force_restart=False):
             print("[On-Demand] Stopping previous FFmpeg process...", flush=True)
             try:
                 ffmpeg_proc.terminate()
-                ffmpeg_proc.wait(timeout=2)
+                ffmpeg_proc.wait(timeout=1.5)
             except Exception:
                 try:
                     ffmpeg_proc.kill()
@@ -329,14 +331,14 @@ def start_stream_for_channel(stream_id, force_restart=False):
                     pass
             ffmpeg_proc = None
 
-        # Clean RAM cache on channel switch
-        with CACHE_LOCK:
-            SEGMENT_CACHE.clear()
-
         os.makedirs(HLS_DIR, exist_ok=True)
-        for f in os.listdir(HLS_DIR):
+        # Remove only old playlist file so clients do not read stale sequence numbers.
+        # DO NOT purge old .ts files or wipe RAM cache immediately:
+        # this allows existing connected devices to finish their buffer without sudden 404!
+        old_playlist = os.path.join(HLS_DIR, "live.m3u8")
+        if os.path.exists(old_playlist):
             try:
-                os.remove(os.path.join(HLS_DIR, f))
+                os.remove(old_playlist)
             except Exception:
                 pass
 
@@ -347,27 +349,31 @@ def start_stream_for_channel(stream_id, force_restart=False):
         active_stream_id = str(stream_id)
         playlist_path = os.path.join(HLS_DIR, "live.m3u8")
 
-        # ROBUST ANTI-CUT & MULTI-CLIENT HLS SETTINGS:
-        # -rw_timeout 15000000: 15s network timeout prevents drops
-        # -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5
-        # -analyzeduration 2000000 -probesize 2000000
-        # -hls_time 3: 3-second segments for smooth delivery
-        # -hls_list_size 15: 15 rolling segments = 45s sliding buffer window
+        # ROBUST ULTRA-FAST STARTUP & STABLE MULTI-CLIENT HLS:
+        # -rw_timeout 10000000: 10s network timeout
+        # -fflags nobuffer+fastseek+flush_packets: Zero latency demuxing
+        # -analyzeduration 500000 -probesize 500000: Minimal probe delay (<200ms)
+        # -hls_init_time 1: Emit chunk 0 in 1.0 second for instant TV playback!
+        # -hls_time 3: 3-second stable subsequent chunks
+        # -hls_list_size 15: 45s sliding buffer window
         # -hls_flags delete_segments+append_list
+        # -hls_segment_type mpegts
         # -hls_allow_cache 1
         cmd = [
             "ffmpeg",
-            "-rw_timeout", "15000000",
+            "-rw_timeout", "10000000",
+            "-fflags", "nobuffer+fastseek+flush_packets",
+            "-analyzeduration", "500000",
+            "-probesize", "500000",
             "-reconnect", "1",
             "-reconnect_at_eof", "1",
             "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-analyzeduration", "2000000",
-            "-probesize", "2000000",
+            "-reconnect_delay_max", "3",
             "-user_agent", "VLC/3.0.18",
             "-i", stream_url,
             "-c", "copy",
             "-f", "hls",
+            "-hls_init_time", "1",
             "-hls_time", "3",
             "-hls_list_size", "15",
             "-hls_flags", "delete_segments+append_list",
@@ -379,7 +385,7 @@ def start_stream_for_channel(stream_id, force_restart=False):
         print(f"[On-Demand] Starting FFmpeg: {stream_url}", flush=True)
         ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        for _ in range(60):
+        for _ in range(80):
             time.sleep(0.1)
             if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
                 try:
@@ -490,8 +496,17 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
 
     def serve_live_m3u8(self):
         playlist_path = os.path.join(HLS_DIR, "live.m3u8")
-        if not os.path.exists(playlist_path):
-            self.send_error(404, "Playlist not ready yet.")
+        # If playlist not ready yet (e.g. FFmpeg is starting chunk 0), wait up to 3.5s
+        for _ in range(35):
+            if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
+                break
+            time.sleep(0.1)
+
+        if not os.path.exists(playlist_path) or os.path.getsize(playlist_path) <= 10:
+            try:
+                self.send_error(404, "Playlist not ready yet.")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
 
         try:
@@ -506,7 +521,10 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            self.send_error(500, f"Error reading playlist: {e}")
+            try:
+                self.send_error(500, f"Error reading playlist: {e}")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def serve_ts_segment(self, segment_name):
         # 1. Check in-memory RAM cache first (instant response for all concurrent accounts)
@@ -517,8 +535,17 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         if data is None:
             # 2. Read from disk and store in RAM cache
             file_path = os.path.join(HLS_DIR, segment_name)
+            # Wait up to 1.5s if segment is currently being flushed
+            for _ in range(15):
+                if os.path.exists(file_path):
+                    break
+                time.sleep(0.1)
+
             if not os.path.exists(file_path):
-                self.send_error(404, f"Segment {segment_name} not found.")
+                try:
+                    self.send_error(404, f"Segment {segment_name} not found.")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
 
             try:
@@ -531,7 +558,10 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                         oldest_key = next(iter(SEGMENT_CACHE))
                         del SEGMENT_CACHE[oldest_key]
             except Exception as e:
-                self.send_error(500, f"Error reading segment: {e}")
+                try:
+                    self.send_error(500, f"Error reading segment: {e}")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
 
         try:
