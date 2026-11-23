@@ -11,6 +11,7 @@ import time
 import socket
 import re
 import base64
+import glob
 
 PORT = 8888
 HLS_DIR = "/tmp/hls"
@@ -31,17 +32,19 @@ DEFAULT_SOURCE_CONFIG = {
     "filename": "playlist.m3u"
 }
 
-active_stream_id = None
-active_channel_name = "Canal+ Foot"
-last_channel_switch_time = 0.0
-ffmpeg_proc = None
-ffmpeg_lock = threading.Lock()
-last_request_time = time.time()
+# PARALLEL MULTI-CHANNEL STREAMING STATE:
+# stream_id -> { "proc": Popen, "last_active": timestamp, "name": str, "playlist": str }
+ACTIVE_STREAMS = {}
+STREAMS_LOCK = threading.Lock()
+MAX_CONCURRENT_CHANNELS = 4
+STREAM_IDLE_TIMEOUT = 50.0 # seconds of no requests before stopping an unviewed channel
+DEFAULT_CHANNEL_ID = "832106"
 
-# In-Memory RAM Segment & Playlist Cache for ultra-fast multi-client streaming
+# In-Memory RAM Segment Cache for ultra-fast response
 SEGMENT_CACHE = {}       # filename -> bytes
 CACHE_LOCK = threading.Lock()
-MAX_CACHE_ITEMS = 30     # Keep last 30 segments in RAM (~90MB)
+MAX_CACHE_ITEMS = 80     # Keep up to 80 segments in RAM (~240MB of 32GB)
+last_global_request_time = time.time()
 
 def _resolve_token(owner):
     env_tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -143,7 +146,7 @@ def start_heartbeat():
         while True:
             time.sleep(60) # every 60 seconds
             now = time.time()
-            if now - last_request_time < 600:
+            if now - last_global_request_time < 600:
                 owner = detect_repo_owner()
                 token = _resolve_token(owner)
                 cs_name = os.environ.get("CODESPACE_NAME") or cs_map.get(owner, "turbo-goggles-j6757vwvvg2qg9r")
@@ -164,6 +167,56 @@ def start_heartbeat():
                 except Exception as e:
                     print(f"[KeepAlive] Heartbeat error: {e}", flush=True)
     t = threading.Thread(target=heartbeat_thread, daemon=True)
+    t.start()
+
+def start_reaper():
+    """Periodically stops FFmpeg processes for channels that have had no viewer requests for STREAM_IDLE_TIMEOUT."""
+    def reaper_thread():
+        while True:
+            time.sleep(5)
+            now = time.time()
+            to_stop = []
+            with STREAMS_LOCK:
+                for sid, info in list(ACTIVE_STREAMS.items()):
+                    # If more than 1 channel is running and one is idle for >50s, reap it
+                    if len(ACTIVE_STREAMS) > 1 and (now - info["last_active"] > STREAM_IDLE_TIMEOUT):
+                        to_stop.append((sid, info))
+
+                for sid, info in to_stop:
+                    print(f"[Reaper] Channel {sid} ({info.get('name')}) idle for >{STREAM_IDLE_TIMEOUT}s. Stopping FFmpeg...", flush=True)
+                    proc = info.get("proc")
+                    if proc:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=1.0)
+                        except Exception:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    if sid in ACTIVE_STREAMS:
+                        del ACTIVE_STREAMS[sid]
+
+                    # Clean segment files for this stopped stream
+                    for sf in glob.glob(os.path.join(HLS_DIR, f"seg_{sid}_*.ts")):
+                        try:
+                            os.remove(sf)
+                        except Exception:
+                            pass
+                    pl_path = os.path.join(HLS_DIR, f"{sid}.m3u8")
+                    if os.path.exists(pl_path):
+                        try:
+                            os.remove(pl_path)
+                        except Exception:
+                            pass
+
+                    # Clean RAM cache for this stream
+                    with CACHE_LOCK:
+                        keys_to_del = [k for k in SEGMENT_CACHE if k.startswith(f"seg_{sid}_") or k == f"{sid}.m3u8"]
+                        for k in keys_to_del:
+                            del SEGMENT_CACHE[k]
+
+    t = threading.Thread(target=reaper_thread, daemon=True)
     t.start()
 
 def load_source_config():
@@ -298,67 +351,75 @@ def build_stream_url_for_channel(stream_id, ch=None):
     return f"http://line.liondnscloud.ru:80/live/5b596694/c750a8bf/{stream_id}.ts"
 
 def start_stream_for_channel(stream_id, force_restart=False):
-    global ffmpeg_proc, active_stream_id, active_channel_name, last_request_time, last_channel_switch_time
-    with ffmpeg_lock:
-        now = time.time()
-        last_request_time = now
+    global last_global_request_time
+    stream_id = str(stream_id).strip()
+    if not stream_id or stream_id == "live":
+        stream_id = DEFAULT_CHANNEL_ID
 
-        # 1. If already streaming this channel and FFmpeg is running, nothing to do
-        if not force_restart and active_stream_id == str(stream_id) and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
-            return True
+    now = time.time()
+    last_global_request_time = now
 
-        # 2. Fast-switch anti-flapping guard:
-        # Ignore duplicate requests for the same channel within 2.0s
-        if not force_restart and active_stream_id is not None and ffmpeg_proc is not None and ffmpeg_proc.poll() is None:
-            if str(stream_id) == active_stream_id:
+    playlist_path = os.path.join(HLS_DIR, f"{stream_id}.m3u8")
+    segment_template = os.path.join(HLS_DIR, f"seg_{stream_id}_%d.ts")
+
+    with STREAMS_LOCK:
+        # 1. If already streaming this channel and healthy, update last_active and return
+        if not force_restart and stream_id in ACTIVE_STREAMS:
+            info = ACTIVE_STREAMS[stream_id]
+            proc = info.get("proc")
+            if proc is not None and proc.poll() is None:
+                info["last_active"] = now
                 return True
-            if now - last_channel_switch_time < 2.0:
-                print(f"[On-Demand] Fast switch debounce: ignoring {stream_id} within 2s of last switch", flush=True)
-                return True
 
-        print(f"[On-Demand] Switching stream to channel ID: {stream_id}", flush=True)
-        last_channel_switch_time = now
-
-        if ffmpeg_proc:
-            print("[On-Demand] Stopping previous FFmpeg process...", flush=True)
-            try:
-                ffmpeg_proc.terminate()
-                ffmpeg_proc.wait(timeout=1.5)
-            except Exception:
+        # 2. If max concurrent channels reached, stop the oldest idle stream
+        if len(ACTIVE_STREAMS) >= MAX_CONCURRENT_CHANNELS:
+            oldest_sid = min(ACTIVE_STREAMS.keys(), key=lambda k: ACTIVE_STREAMS[k]["last_active"])
+            old_info = ACTIVE_STREAMS.pop(oldest_sid)
+            print(f"[Multi-Stream] Max concurrent channels ({MAX_CONCURRENT_CHANNELS}) reached. Stopping oldest: {oldest_sid}", flush=True)
+            if old_info.get("proc"):
                 try:
-                    ffmpeg_proc.kill()
+                    old_info["proc"].terminate()
+                    old_info["proc"].wait(timeout=1.0)
                 except Exception:
-                    pass
-            ffmpeg_proc = None
+                    try:
+                        old_info["proc"].kill()
+                    except Exception:
+                        pass
+
+        # 3. Terminate any previous dead process for this channel
+        if stream_id in ACTIVE_STREAMS:
+            old_proc = ACTIVE_STREAMS[stream_id].get("proc")
+            if old_proc:
+                try:
+                    old_proc.terminate()
+                    old_proc.wait(timeout=1.0)
+                except Exception:
+                    try:
+                        old_proc.kill()
+                    except Exception:
+                        pass
+            del ACTIVE_STREAMS[stream_id]
+
+        ch = get_channel_by_id(stream_id)
+        ch_name = ch.get("name", f"Canal {stream_id}") if ch else f"Canal {stream_id}"
+        stream_url = build_stream_url_for_channel(stream_id, ch)
 
         os.makedirs(HLS_DIR, exist_ok=True)
-        # Remove only old playlist file so clients do not read stale sequence numbers.
-        # DO NOT purge old .ts files or wipe RAM cache immediately:
-        # this allows existing connected devices to finish their buffer without sudden 404!
-        old_playlist = os.path.join(HLS_DIR, "live.m3u8")
-        if os.path.exists(old_playlist):
+
+        # Clean old playlist file so player does not read stale sequences
+        if os.path.exists(playlist_path):
             try:
-                os.remove(old_playlist)
+                os.remove(playlist_path)
             except Exception:
                 pass
 
-        ch = get_channel_by_id(stream_id)
-        active_channel_name = ch.get("name", f"Canal {stream_id}") if ch else f"Canal {stream_id}"
-        stream_url = build_stream_url_for_channel(stream_id, ch)
+        # Clean old segments for this channel
+        for sf in glob.glob(os.path.join(HLS_DIR, f"seg_{stream_id}_*.ts")):
+            try:
+                os.remove(sf)
+            except Exception:
+                pass
 
-        active_stream_id = str(stream_id)
-        playlist_path = os.path.join(HLS_DIR, "live.m3u8")
-
-        # ROBUST ULTRA-FAST STARTUP & STABLE MULTI-CLIENT HLS:
-        # -rw_timeout 10000000: 10s network timeout
-        # -fflags nobuffer+fastseek+flush_packets: Zero latency demuxing
-        # -analyzeduration 500000 -probesize 500000: Minimal probe delay (<200ms)
-        # -hls_init_time 1: Emit chunk 0 in 1.0 second for instant TV playback!
-        # -hls_time 3: 3-second stable subsequent chunks
-        # -hls_list_size 15: 45s sliding buffer window
-        # -hls_flags delete_segments+append_list
-        # -hls_segment_type mpegts
-        # -hls_allow_cache 1
         cmd = [
             "ffmpeg",
             "-rw_timeout", "10000000",
@@ -378,25 +439,33 @@ def start_stream_for_channel(stream_id, force_restart=False):
             "-hls_list_size", "15",
             "-hls_flags", "delete_segments+append_list",
             "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", segment_template,
             "-hls_allow_cache", "1",
             playlist_path
         ]
 
-        print(f"[On-Demand] Starting FFmpeg: {stream_url}", flush=True)
-        ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[Multi-Stream] Starting parallel FFmpeg for channel {stream_id} ({ch_name}): {stream_url}", flush=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ACTIVE_STREAMS[stream_id] = {
+            "proc": proc,
+            "last_active": now,
+            "name": ch_name,
+            "playlist": playlist_path
+        }
 
-        for _ in range(80):
-            time.sleep(0.1)
-            if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
-                try:
-                    with open(playlist_path, "r", errors="ignore") as pf:
-                        if "#EXTINF" in pf.read():
-                            print(f"[On-Demand] Playlist with active segments ready for channel {stream_id}!", flush=True)
-                            break
-                except Exception:
-                    pass
+    # Wait up to 3.5s for initial segments to be ready
+    for _ in range(35):
+        time.sleep(0.1)
+        if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
+            try:
+                with open(playlist_path, "r", errors="ignore") as pf:
+                    if "#EXTINF" in pf.read():
+                        print(f"[Multi-Stream] Playlist ready with active segments for channel {stream_id}!", flush=True)
+                        break
+            except Exception:
+                pass
 
-        return True
+    return True
 
 class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -428,8 +497,8 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        global last_request_time
-        last_request_time = time.time()
+        global last_global_request_time
+        last_global_request_time = time.time()
 
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -437,16 +506,16 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         # 1. On-Demand Channel Stream: /hls/<stream_id>.m3u8?token=...
         if path.startswith("/hls/") and path.endswith(".m3u8"):
             stream_id = path.replace("/hls/", "").replace(".m3u8", "").strip()
-            if stream_id:
-                start_stream_for_channel(stream_id)
-            self.serve_live_m3u8()
+            if not stream_id or stream_id == "live":
+                stream_id = DEFAULT_CHANNEL_ID
+            start_stream_for_channel(stream_id)
+            self.serve_channel_m3u8(stream_id)
             return
 
         # 2. Direct or legacy playlist: /live.m3u8 or /bein1.m3u8
         if path in ["/bein1.m3u8", "/live.m3u8"]:
-            if active_stream_id is None:
-                start_stream_for_channel("832106")
-            self.serve_live_m3u8()
+            start_stream_for_channel(DEFAULT_CHANNEL_ID)
+            self.serve_channel_m3u8(DEFAULT_CHANNEL_ID)
             return
 
         # 3. TS Video segments with in-memory RAM caching for multi-client performance
@@ -457,13 +526,23 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
 
         # 4. Status API
         if path == "/api/status":
+            now = time.time()
+            with STREAMS_LOCK:
+                active_list = []
+                for sid, info in ACTIVE_STREAMS.items():
+                    active_list.append({
+                        "id": sid,
+                        "name": info.get("name"),
+                        "last_active_sec_ago": round(now - info.get("last_active", 0), 1),
+                        "running": info.get("proc") is not None and info["proc"].poll() is None
+                    })
             self.render_json({
                 "status": "online",
-                "mode": "on_demand_multithreaded",
-                "active_stream_id": active_stream_id,
-                "active_channel_name": active_channel_name,
+                "mode": "parallel_multi_channel",
+                "active_channels_count": len(active_list),
+                "active_channels": active_list,
                 "cached_segments_in_ram": len(SEGMENT_CACHE),
-                "ffmpeg_running": ffmpeg_proc is not None and ffmpeg_proc.poll() is None
+                "max_concurrent_channels": MAX_CONCURRENT_CHANNELS
             })
             return
 
@@ -494,9 +573,9 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def serve_live_m3u8(self):
-        playlist_path = os.path.join(HLS_DIR, "live.m3u8")
-        # If playlist not ready yet (e.g. FFmpeg is starting chunk 0), wait up to 3.5s
+    def serve_channel_m3u8(self, stream_id):
+        playlist_path = os.path.join(HLS_DIR, f"{stream_id}.m3u8")
+        # If playlist not ready yet (e.g. FFmpeg starting chunk 0), wait up to 3.5s
         for _ in range(35):
             if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 10:
                 break
@@ -504,10 +583,15 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
 
         if not os.path.exists(playlist_path) or os.path.getsize(playlist_path) <= 10:
             try:
-                self.send_error(404, "Playlist not ready yet.")
+                self.send_error(404, f"Playlist for channel {stream_id} not ready yet.")
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
+
+        # Update last active for this stream
+        with STREAMS_LOCK:
+            if stream_id in ACTIVE_STREAMS:
+                ACTIVE_STREAMS[stream_id]["last_active"] = time.time()
 
         try:
             with open(playlist_path, "rb") as f:
@@ -527,6 +611,14 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                 pass
 
     def serve_ts_segment(self, segment_name):
+        # Update last active for the corresponding channel
+        m = re.match(r"seg_(\d+)_", segment_name)
+        if m:
+            sid = m.group(1)
+            with STREAMS_LOCK:
+                if sid in ACTIVE_STREAMS:
+                    ACTIVE_STREAMS[sid]["last_active"] = time.time()
+
         # 1. Check in-memory RAM cache first (instant response for all concurrent accounts)
         data = None
         with CACHE_LOCK:
@@ -586,8 +678,11 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
                 save_source_config(new_cfg)
                 if new_cfg.get("type") == "xtream":
                     threading.Thread(target=sync_xtream_channels, args=(new_cfg,), daemon=True).start()
-                if active_stream_id:
-                    start_stream_for_channel(active_stream_id, force_restart=True)
+                # Restart active streams with new source
+                with STREAMS_LOCK:
+                    current_sids = list(ACTIVE_STREAMS.keys())
+                for sid in current_sids:
+                    start_stream_for_channel(sid, force_restart=True)
                 cur_cfg = load_source_config()
                 self.render_json({"success": True, "message": "Source mise à jour avec succès", "config": cur_cfg})
             except Exception as e:
@@ -626,11 +721,15 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
             cat = ch.get("category", "Autres")
             categories.setdefault(cat, []).append(ch)
 
+        with STREAMS_LOCK:
+            active_sids = set(ACTIVE_STREAMS.keys())
+            active_info = ", ".join([f"{info.get('name')} ({sid})" for sid, info in ACTIVE_STREAMS.items()]) or "Aucune"
+
         html = f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Family Stream - Relais VIP</title>
+    <title>Family Stream - Relais VIP Multi-Flux</title>
     <style>
         body {{ background: #0f172a; color: #f8fafc; font-family: system-ui, sans-serif; padding: 20px; }}
         .header {{ background: #1e293b; padding: 20px; border-radius: 12px; margin-bottom: 20px; }}
@@ -641,14 +740,14 @@ class OnDemandRelayHandler(http.server.SimpleHTTPRequestHandler):
 </head>
 <body>
     <div class="header">
-        <h1>⚡ Family Stream - Relais VIP Multi-Sources</h1>
-        <p>Chaîne active : <strong>{active_channel_name} ({active_stream_id})</strong></p>
+        <h1>⚡ Family Stream - Relais VIP Multi-Flux Parallèles</h1>
+        <p>Chaînes actives en direct ({len(active_sids)}/{MAX_CONCURRENT_CHANNELS}) : <strong>{active_info}</strong></p>
     </div>
 """
         for cat, chs in categories.items():
             html += f"<h2>{cat} ({len(chs)})</h2>"
             for ch in chs[:10]:
-                is_active = (str(ch.get("id")) == str(active_stream_id))
+                is_active = (str(ch.get("id")) in active_sids)
                 cls = "active" if is_active else ""
                 html += f"""
                 <div class="channel-card {cls}">
@@ -678,14 +777,21 @@ if __name__ == "__main__":
     start_tunnel_watcher()
     # 2. Start Keep-Alive Heartbeat in background (prevents GitHub 30m idle timeout while watching)
     start_heartbeat()
-    # 3. Pre-start Canal+ Foot (832106)
-    start_stream_for_channel("832106")
+    # 3. Start Inactive Stream Reaper (stops unviewed streams after 50s)
+    start_reaper()
+    # 4. Pre-start default Canal+ Foot (832106)
+    start_stream_for_channel(DEFAULT_CHANNEL_ID)
 
     server_address = ("", PORT)
     with ThreadedHTTPServer(server_address, OnDemandRelayHandler) as httpd:
-        print(f"[Family Stream Relay] Multi-Threaded Server running on port {PORT}", flush=True)
+        print(f"[Family Stream Relay] Multi-Threaded Multi-Channel Server running on port {PORT}", flush=True)
         try:
             httpd.serve_forever()
         finally:
-            if ffmpeg_proc:
-                ffmpeg_proc.kill()
+            with STREAMS_LOCK:
+                for sid, info in ACTIVE_STREAMS.items():
+                    if info.get("proc"):
+                        try:
+                            info["proc"].kill()
+                        except Exception:
+                            pass
